@@ -136,8 +136,7 @@ elif menu == "🤖 Escanear Nota y Registrar Caso":
 
     cursor.execute("SELECT COUNT(*) FROM casos_operativos")
     total_actual = cursor.fetchone()
-    siguiente_id = f"OP-{total_actual + 1:03d}"
-
+        siguiente_id = f"OP-{total_actual[0] + 1:03d}"
     for campo in ["ia_fecha", "ia_metrik", "ia_nombre", "ia_tel", "ia_email", "ia_sector", "ia_desc"]:
         if campo not in st.session_state:
             st.session_state[campo] = ""
