@@ -1,0 +1,229 @@
+import streamlit as st
+import sqlite3
+import pandas as pd
+from datetime import datetime
+import io
+import json
+from PIL import Image
+import google.generativeai as genai
+
+def conectar_db():
+    conn = sqlite3.connect("casos_operativos_ancon.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS casos_operativos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id_caso TEXT,
+            fecha_documento TEXT,
+            to_metrik TEXT,
+            nombre_ciudadano TEXT,
+            telefono TEXT,
+            email TEXT,
+            sector_comunidad TEXT,
+            descripcion_solicitud TEXT,
+            importancia TEXT,
+            observacion TEXT,
+            apoyo_entidad TEXT,
+            estado TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS entidades_apoyo (
+            nombre_entidad TEXT PRIMARY KEY
+        )
+    """)
+    cursor.execute("SELECT COUNT(*) FROM entidades_apoyo")
+    if cursor.fetchone() == 0:
+        entidades = [
+            ("Junta Comunal (Local)",),
+            ("Ornato",),
+            ("Infraestructura",),
+            ("Atención Ciudadana",),
+            ("Trabajo Social",),
+            ("MOP / IDAAN / Naturgy (Externa)",)
+        ]
+        cursor.executemany("INSERT INTO entidades_apoyo (nombre_entidad) VALUES (?)", entidades)
+    conn.commit()
+    return conn
+
+st.set_page_config(page_title="Control Operativo de Casos - Ancón", layout="wide")
+st.title("📂 Control Operativo de Casos y Notas Ciudadanas")
+st.markdown("### Junta Comunal de Ancón — Escaneo Inteligente y Seguimiento")
+
+conn = conectar_db()
+cursor = conn.cursor()
+
+ia_activa = False
+if "GEMINI_API_KEY" in st.secrets:
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    ia_activa = True
+
+cursor.execute("SELECT nombre_entidad FROM entidades_apoyo")
+lista_entidades = [e for e in cursor.fetchall()]
+
+menu = st.sidebar.selectbox("Módulos del Sistema", [
+    "📋 Tablero General de Casos",
+    "🤖 Escanear Nota y Registrar Caso",
+    "🏢 Agregar Entidades / Departamentos"
+])
+
+if menu == "📋 Tablero General de Casos":
+    st.header("📋 Matriz Operativa de Casos")
+    df_raw = pd.read_sql_query("SELECT * FROM casos_operativos ORDER BY id ASC", conn)
+    
+    if not df_raw.empty:
+        hoy = datetime.today()
+        dias_lista = []
+        for f_str in df_raw["fecha_documento"]:
+            try:
+                f_doc = datetime.strptime(str(f_str), "%d/%m/%Y")
+                diff = (hoy - f_doc).days
+                dias_lista.append(f"{max(0, diff)} días")
+            except Exception:
+                dias_lista.append("0 días")
+        
+        df_mostrar = pd.DataFrame({
+            "ID_CASO": df_raw["id_caso"],
+            "FECHA_DOCUMENTO": df_raw["fecha_documento"],
+            "TO_METRIK": df_raw["to_metrik"],
+            "NOMBRE_CIUDADANO": df_raw["nombre_ciudadano"],
+            "TELEFONO": df_raw["telefono"],
+            "EMAIL": df_raw["email"],
+            "SECTOR_COMUNIDAD": df_raw["sector_comunidad"],
+            "DESCRIPCION_SOLICITUD": df_raw["descripcion_solicitud"],
+            "IMPORTANCIA": df_raw["importancia"],
+            "OBSERVACION": df_raw["observacion"],
+            "APOYO_ENTIDAD": df_raw["apoyo_entidad"],
+            "DIAS_ESPERA": dias_lista,
+            "ESTADO": df_raw["estado"]
+        })
+        
+        st.dataframe(df_mostrar, use_container_width=True, hide_index=True)
+        
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df_mostrar.to_excel(writer, index=False, sheet_name='Matriz_Casos_Ancon')
+        st.download_button("📥 Descargar Matriz en Excel (.xlsx)", data=output.getvalue(), file_name="Matriz_Operativa_Ancon.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        
+        st.markdown("---")
+        st.subheader("✏️ Actualizar Caso (Importancia, Entidad o Estado)")
+        caso_sel = st.selectbox("Seleccione el ID_CASO a actualizar:", df_raw["id_caso"].tolist())
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            nueva_imp = st.selectbox("IMPORTANCIA:", ["Por definir", "Baja", "Media", "Alta", "Urgente"])
+        with c2:
+            nueva_ent = st.selectbox("APOYO_ENTIDAD:", lista_entidades)
+        with c3:
+            nuevo_est = st.selectbox("ESTADO:", ["Por atender", "En proceso", "En espera de entidad", "Resuelto"])
+        nueva_obs = st.text_input("OBSERVACION:", value="Ninguna")
+        
+        if st.button("💾 Guardar Cambios del Caso"):
+            cursor.execute("""
+                UPDATE casos_operativos 
+                SET importancia = ?, apoyo_entidad = ?, estado = ?, observacion = ? 
+                WHERE id_caso = ?
+            """, (nueva_imp, nueva_ent, nuevo_est, nueva_obs, caso_sel))
+            conn.commit()
+            st.success(f"✔️ Caso {caso_sel} actualizado correctamente.")
+            st.rerun()
+    else:
+        st.info("Aún no hay casos registrados. Ve al menú 'Escanear Nota y Registrar Caso' para agregar el primero.")
+elif menu == "🤖 Escanear Nota y Registrar Caso":
+    st.header("🤖 Recepción y Lectura de Notas Físicas")
+    
+    if not ia_activa:
+        st.warning("⚠️ Agrega tu 'GEMINI_API_KEY' en los Secrets de Streamlit para activar el escaneo con IA. Mientras tanto puedes llenar los datos manualmente.")
+
+    cursor.execute("SELECT COUNT(*) FROM casos_operativos")
+    total_actual = cursor.fetchone()
+    siguiente_id = f"OP-{total_actual + 1:03d}"
+
+    for campo in ["ia_fecha", "ia_metrik", "ia_nombre", "ia_tel", "ia_email", "ia_sector", "ia_desc"]:
+        if campo not in st.session_state:
+            st.session_state[campo] = ""
+
+    foto_doc = st.file_uploader("Suba la foto de la nota o carta ciudadana (JPG, PNG):", type=["jpg", "jpeg", "png"])
+    
+    if foto_doc is not None:
+        img = Image.open(foto_doc)
+        st.image(img, caption="Nota cargada", width=350)
+        
+        if ia_activa and st.button("✨ Escanear Nota con IA"):
+            with st.spinner("Extrayendo datos de la nota..."):
+                try:
+                    modelo = genai.GenerativeModel("gemini-1.5-flash")
+                    prompt = """
+                    Extrae los datos de esta nota ciudadana dirigida a la Junta Comunal de Ancón.
+                    Devuelve ÚNICAMENTE un JSON válido sin texto extra ni comillas markdown:
+                    {
+                        "fecha_documento": "fecha del documento en formato DD/MM/YYYY, si no tiene dejar vacío",
+                        "to_metrik": "código de nota o referencia si tiene (ej. JCA-2026-181), sino dejar vacío",
+                        "nombre_ciudadano": "nombre completo del ciudadano o solicitante, si no se lee poner 'Revisar Nota Física'",
+                        "telefono": "número de teléfono o celular si aparece, sino poner 'No registrado'",
+                        "email": "correo electrónico si aparece, sino poner 'No registrado'",
+                        "sector_comunidad": "sector o comunidad (ej. Ancon Centro, Paraíso, Gamboa, Diablo, Veracruz, Curundú)",
+                        "descripcion_solicitud": "descripción corta y clara del trámite o solicitud (ej. Permiso de Poda/Tala de Arbol)"
+                    }
+                    """
+                    resp = modelo.generate_content([prompt, img])
+                    limpio = resp.text.replace("```json", "").replace("```", "").strip()
+                    datos = json.loads(limpio)
+                    
+                    st.session_state["ia_fecha"] = datos.get("fecha_documento", datetime.today().strftime("%d/%m/%Y"))
+                    st.session_state["ia_metrik"] = datos.get("to_metrik", "")
+                    st.session_state["ia_nombre"] = datos.get("nombre_ciudadano", "")
+                    st.session_state["ia_tel"] = datos.get("telefono", "No registrado")
+                    st.session_state["ia_email"] = datos.get("email", "No registrado")
+                    st.session_state["ia_sector"] = datos.get("sector_comunidad", "Ancon Centro")
+                    st.session_state["ia_desc"] = datos.get("descripcion_solicitud", "")
+                    st.success("✔️ Datos extraídos. Verifica los campos y selecciona el departamento abajo.")
+                except Exception as e:
+                    st.error(f"Error al leer la imagen: {e}")
+
+    st.markdown("---")
+    st.subheader(f"📝 Verificar Datos y Asignar Entidad ({siguiente_id})")
+    with st.form("form_nuevo_caso", clear_on_submit=True):
+        c_f1, c_f2, c_f3 = st.columns(3)
+        with c_f1:
+            in_id = st.text_input("ID_CASO:", value=siguiente_id)
+            in_fecha = st.text_input("FECHA_DOCUMENTO (DD/MM/YYYY):", value=st.session_state["ia_fecha"] or datetime.today().strftime("%d/%m/%Y"))
+            in_metrik = st.text_input("TO_METRIK (Código de Nota):", value=st.session_state["ia_metrik"])
+            in_nombre = st.text_input("NOMBRE_CIUDADANO:", value=st.session_state["ia_nombre"])
+        with c_f2:
+            in_tel = st.text_input("TELEFONO:", value=st.session_state["ia_tel"] or "No registrado")
+            in_email = st.text_input("EMAIL:", value=st.session_state["ia_email"] or "No registrado")
+            in_sector = st.text_input("SECTOR_COMUNIDAD:", value=st.session_state["ia_sector"] or "Ancon Centro")
+            in_imp = st.selectbox("IMPORTANCIA (Manual):", ["Por definir", "Baja", "Media", "Alta", "Urgente"])
+        with c_f3:
+            in_apoyo = st.selectbox("APOYO_ENTIDAD (Asignación Manual):", lista_entidades)
+            in_estado = st.selectbox("ESTADO:", ["Por atender", "En proceso", "En espera de entidad", "Resuelto"])
+            in_obs = st.text_input("OBSERVACION:", value="Ninguna")
+        
+        in_desc = st.text_area("DESCRIPCION_SOLICITUD:", value=st.session_state["ia_desc"])
+        
+        if st.form_submit_button("💾 Guardar Caso en la Matriz"):
+            cursor.execute("""
+                INSERT INTO casos_operativos (id_caso, fecha_documento, to_metrik, nombre_ciudadano, telefono, email, sector_comunidad, descripcion_solicitud, importancia, observacion, apoyo_entidad, estado)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (in_id, in_fecha, in_metrik, in_nombre, in_tel, in_email, in_sector, in_desc, in_imp, in_obs, in_apoyo, in_estado))
+            conn.commit()
+            for campo in ["ia_fecha", "ia_metrik", "ia_nombre", "ia_tel", "ia_email", "ia_sector", "ia_desc"]:
+                st.session_state[campo] = ""
+            st.success(f"🎉 Caso {in_id} guardado y asignado a **{in_apoyo}**.")
+
+elif menu == "🏢 Agregar Entidades / Departamentos":
+    st.header("🏢 Catálogo de Entidades y Departamentos de Apoyo")
+    with st.form("form_entidad", clear_on_submit=True):
+        nueva_entidad = st.text_input("Nombre del departamento o institución externa (ej. MiAmbiente, SINAPROC, Obras Comunitarias):")
+        if st.form_submit_button("Agregar a la Lista"):
+            if nueva_entidad.strip() != "":
+                try:
+                    cursor.execute("INSERT INTO entidades_apoyo (nombre_entidad) VALUES (?)", (nueva_entidad.strip(),))
+                    conn.commit()
+                    st.success(f"✔️ '{nueva_entidad}' agregado.")
+                    st.rerun()
+                except Exception:
+                    st.error("❌ Ya existe en la lista.")
+    st.dataframe(pd.DataFrame(lista_entidades, columns=["Entidades / Departamentos Activos"]), use_container_width=True, hide_index=True)
+
+conn.close()
